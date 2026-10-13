@@ -1,0 +1,18 @@
+name: apartmint-local
+services:
+  redis:
+    image: redis:7.4.6-alpine
+    user: "999:1000"
+    command: [redis-server, --save, "", --appendonly, "no"]
+    ports: ["127.0.0.1:16379:6379"]
+    read_only: true
+    tmpfs: ["/data:uid=999,gid=1000,mode=0700"]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [private]
+    restart: unless-stopped
+networks:
+  private:
+    # Docker Desktop does not publish ports on an internal-only network.
+    # This development broker has only source identifiers; inference stays sandboxed.
+    driver: bridge

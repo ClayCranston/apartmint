@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+.venv/
+.runtime/
+models/
+data/
+dist/
+__pycache__/
+*.pyc
+.pytest_cache/
+.apartmint-*
+config/tour-contact.json
+config/tour-offer.json
+config/sources.json
+.DS_Store
+*.egg-info/

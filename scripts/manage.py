@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+"""Stdlib lifecycle bootstrap; works without an installed .venv."""
+from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'src'))
+from apartmint.lifecycle import main
+
+if __name__ == '__main__':
+    raise SystemExit(main(root=ROOT))

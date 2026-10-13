@@ -1,0 +1,180 @@
+name: apartmint
+
+x-app: &app
+  image: apartmint-worker:0.4.0
+  build: .
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  tmpfs: [/tmp]
+  restart: unless-stopped
+
+services:
+  redis:
+    image: redis:7.4.6-alpine
+    user: "999:1000"
+    command: [redis-server, --save, "", --appendonly, "no"]
+    networks: [private]
+    read_only: true
+    tmpfs: ["/data:uid=999,gid=1000,mode=0700"]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  vllm:
+    image: ${APARTMINT_VLLM_IMAGE:-vllm/vllm-openai:v0.31.0-cu129}
+    profiles: [cuda]
+    networks: [private]
+    volumes:
+      - ${APARTMINT_MODEL_DIR:-./models/qwen3-8b-nvfp4}:/model:ro
+    environment:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      VLLM_NO_USAGE_STATS: "1"
+      DO_NOT_TRACK: "1"
+      HF_HOME: /tmp/huggingface
+      VLLM_CACHE_ROOT: /tmp/vllm
+      VLLM_HOST_IP: "127.0.0.1"
+      HOME: /tmp
+      XDG_CACHE_HOME: /tmp/cache
+      TRITON_CACHE_DIR: /tmp/triton
+      FLASHINFER_WORKSPACE_BASE: /tmp
+      CUDA_CACHE_PATH: /tmp/cuda
+    command:
+      - /model
+      - --served-model-name
+      - apartmint-qwen3
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --max-model-len
+      - "8192"
+      - --max-num-seqs
+      - "1"
+      - --max-num-batched-tokens
+      - "2048"
+      - --gpu-memory-utilization
+      - ${APARTMINT_GPU_MEMORY:-0.70}
+      - --dtype
+      - half
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - hermes
+      - --reasoning-parser
+      - qwen3
+      - --no-enable-log-requests
+      - --disable-uvicorn-access-log
+      - --disable-log-stats
+      - --disable-fastapi-docs
+    # Quantization is read from the pinned checkpoint's config (ModelOpt FP4/AWQ).
+    # Do not enable trust_remote_code. No public ports or host-network mode.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${APARTMINT_GPU:-0}"]
+              capabilities: [gpu]
+    shm_size: 2gb
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: [CMD, python3, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      start_period: 180s
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  secrets-init:
+    image: apartmint-worker:0.4.0
+    build: .
+    profiles: [cuda]
+    user: "0:0"
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE]
+    security_opt: [no-new-privileges:true]
+    entrypoint: [python, -c]
+    command: ["import os, pathlib, shutil; p=pathlib.Path('/private/runtime.env'); shutil.copyfile('/run/secrets/private_runtime_env',p); p.chmod(0o600); os.chown(p,10001,10001)"]
+    secrets: [private_runtime_env]
+    volumes: ["private-config:/private"]
+
+  worker:
+    <<: *app
+    profiles: [cuda]
+    entrypoint: [celery]
+    command: [-A, apartmint.tasks:inference_app, worker, -Q, inference, --concurrency=1, --pool=solo, --loglevel=WARNING, --without-gossip, --without-mingle, --without-heartbeat]
+    networks: [private]
+    environment:
+      APARTMINT_CONFIG: /config/sources.json
+      APARTMINT_DATA_DIR: /data
+      APARTMINT_MODEL_BASE_URL: http://vllm:8000/v1
+      APARTMINT_MODEL: apartmint-qwen3
+      APARTMINT_BROKER_URL: redis://redis:6379/0
+      APARTMINT_MAX_SNAPSHOT_AGE_SECONDS: ${APARTMINT_MAX_SNAPSHOT_AGE_SECONDS:-1800}
+    volumes:
+      - ./config:/config:ro
+      - inbox:/data/inbox:ro
+      - results:/data
+      - private-config:/run/private:ro
+    depends_on:
+      redis: {condition: service_healthy}
+      vllm: {condition: service_healthy}
+      secrets-init: {condition: service_completed_successfully}
+
+  collector:
+    <<: *app
+    tmpfs: [/tmp, "/data:uid=10001,gid=10001,mode=0700"]
+    profiles: [monitor]
+    entrypoint: [celery]
+    command: [-A, apartmint.tasks:collector_app, worker, -Q, collector, --concurrency=1, --pool=solo, --loglevel=WARNING, --without-gossip, --without-mingle, --without-heartbeat]
+    networks: [private, internet]
+    environment:
+      APARTMINT_CONFIG: /config/sources.json
+      APARTMINT_DATA_DIR: /data
+      APARTMINT_BROKER_URL: redis://redis:6379/0
+    volumes:
+      - ./config/sources.json:/config/sources.json:ro
+      - inbox:/data/inbox
+    depends_on:
+      redis: {condition: service_healthy}
+
+  beat:
+    <<: *app
+    profiles: [monitor]
+    entrypoint: [celery]
+    command: [-A, apartmint.tasks:collector_app, beat, --loglevel=WARNING, --schedule=/tmp/celerybeat-schedule]
+    networks: [private]
+    environment:
+      APARTMINT_CONFIG: /config/sources.json
+      APARTMINT_BROKER_URL: redis://redis:6379/0
+      APARTMINT_POLL_SECONDS: ${APARTMINT_POLL_SECONDS:-900}
+    volumes:
+      - ./config/sources.json:/config/sources.json:ro
+    depends_on:
+      redis: {condition: service_healthy}
+
+networks:
+  private:
+    internal: true
+  internet: {}
+
+volumes:
+  inbox: {}
+  results: {}
+  private-config: {}
+
+secrets:
+  private_runtime_env:
+    file: ./.env
